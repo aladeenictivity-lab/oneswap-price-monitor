@@ -1,0 +1,21 @@
+# Logs
+logs/
+
+# Env
+.env
+.env.local
+
+# Node
+node_modules/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
