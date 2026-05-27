@@ -24,6 +24,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { OneswapClient } from '../lib/oneswap.js';
+import { CantonClient } from '../lib/canton.js';
 import { Wallet } from '../lib/wallet.js';
 import { TelegramNotifier } from '../lib/notifier.js';
 import { sleep, nowIso } from '../lib/util.js';
@@ -46,10 +47,13 @@ export const cfg = {
   reboundPct: Number(process.env.REBOUND_RECOVER_PCT || 80),
   tgToken: process.env.TELEGRAM_BOT_TOKEN || '',
   tgChat: process.env.TELEGRAM_CHAT_ID || '',
-  // Auth (optional — enables authenticated quote endpoint)
+  // Auth (optional — enables authenticated quote + swap)
   privHex: process.env.PRIVATE_KEY_HEX || '',
   pubHex: process.env.PUBLIC_KEY_HEX || '',
   partyId: process.env.RECEIVER_PARTY || '',
+  cantonBaseUrl: process.env.CANTON_BASE_URL || 'https://consolewallet.io',
+  slippage: parseFloat(process.env.SLIPPAGE_TOLERANCE || '0.05'),
+  swapCooldownSec: parseInt(process.env.SWAP_COOLDOWN_SEC || '60', 10),
   quotePresets: {
     USDCx: csvNums(process.env.QUOTE_PRESETS_USDCX),
     CC: csvNums(process.env.QUOTE_PRESETS_CC),
@@ -138,27 +142,160 @@ export const tg = new TelegramNotifier({ botToken: cfg.tgToken, chatId: cfg.tgCh
 
 // OneSwap client (authenticated if keys provided, otherwise read-only fallback)
 export let oneswap = null;
+export let canton = null;
+export let wallet = null;
+
+// Swap state
+let swapCooldownUntil = 0;
+let swapInProgress = false;
+
+export function isSwapCapable() {
+  return !!(oneswap && canton && cfg.privHex && cfg.pubHex && cfg.partyId);
+}
+
+export function isSwapOnCooldown() {
+  return Date.now() < swapCooldownUntil;
+}
+
+export function getSwapCooldownRemaining() {
+  return Math.max(0, Math.ceil((swapCooldownUntil - Date.now()) / 1000));
+}
 
 async function initOneswapClient() {
   if (cfg.privHex && cfg.pubHex && cfg.partyId) {
     try {
-      const wallet = new Wallet(cfg.privHex, cfg.pubHex);
+      wallet = new Wallet(cfg.privHex, cfg.pubHex);
       await wallet.ensureMatch();
+
+      const logger = { info: (...a) => log('info', a.join(' ')), warn: (...a) => log('warn', a.join(' ')) };
+
+      // Init Canton client (for balance + transfer)
+      canton = new CantonClient({
+        baseUrl: cfg.cantonBaseUrl,
+        wallet,
+        partyId: cfg.partyId,
+        logger,
+      });
+      await canton.login();
+      log('info', '✓ CantonClient logged in');
+
+      // Init OneSwap client (for quote + intent)
       oneswap = new OneswapClient({
         baseUrl: cfg.api,
         wallet,
         partyId: cfg.partyId,
-        logger: { info: (...a) => log('info', a.join(' ')), warn: (...a) => log('warn', a.join(' ')) },
+        logger,
       });
       await oneswap.login();
       log('info', '✓ OneswapClient authenticated (challenge→sign→verify)');
+
+      // Get initial balance
+      const bal = await canton.getBalances();
+      const ccBal = bal.balances?.find(b => b.coin === 'CC')?.balance || '0';
+      const usdcxBal = bal.balances?.find(b => b.coin === 'USDCx')?.balance || '0';
+      log('info', `Balance: CC=${ccBal}, USDCx=${usdcxBal}`);
       return;
     } catch (e) {
       log('warn', `Auth failed, falling back to read-only: ${e.message}`);
+      oneswap = null;
+      canton = null;
+      wallet = null;
     }
   }
   // Fallback: unauthenticated fetch
   log('info', 'Running in read-only mode (no PRIVATE_KEY_HEX / RECEIVER_PARTY)');
+}
+
+// ---------- Balance ----------
+export async function getBalances() {
+  if (!canton) return null;
+  try {
+    const bal = await canton.getBalances();
+    return {
+      CC: parseFloat(bal.balances?.find(b => b.coin === 'CC')?.balance || '0'),
+      USDCx: parseFloat(bal.balances?.find(b => b.coin === 'USDCx')?.balance || '0'),
+      CBTC: parseFloat(bal.balances?.find(b => b.coin === 'CBTC')?.balance || '0'),
+    };
+  } catch (e) {
+    log('error', `getBalances failed: ${e.message}`);
+    return null;
+  }
+}
+
+// ---------- Swap Execution ----------
+/**
+ * Execute a swap: createSwapIntent → Canton transfer → poll completion
+ * @param {object} params
+ * @param {string} params.pairKey - 'CC_USDCX' or 'CC_CBTC'
+ * @param {string} params.inputToken - 'CC', 'USDCx', or 'CBTC'
+ * @param {string} params.amount - decimal amount
+ * @returns {object} result with status, actualOutput, etc.
+ */
+export async function executeSwap({ pairKey, inputToken, amount }) {
+  if (!isSwapCapable()) throw new Error('Swap not configured (need PRIVATE_KEY_HEX + RECEIVER_PARTY)');
+  if (swapInProgress) throw new Error('Swap already in progress');
+  if (isSwapOnCooldown()) throw new Error(`Cooldown active (${getSwapCooldownRemaining()}s remaining)`);
+
+  const p = cfg.pairs.find(x => x.key === pairKey);
+  if (!p) throw new Error(`Unknown pair: ${pairKey}`);
+
+  const outputToken = inputToken === 'CC' ? p.quote : 'CC';
+
+  swapInProgress = true;
+  try {
+    // 1. Quote first
+    const q = await oneswap.getQuote({ poolId: p.poolId, inputToken, inputAmount: amount });
+    const outAmt = parseFloat(q.outputAmount ?? q.expectedOutputAmount ?? '0');
+    const rate = outAmt / parseFloat(amount);
+    log('info', `Swap quote: ${amount} ${inputToken} → ${outAmt.toFixed(6)} ${outputToken} (rate=${rate.toFixed(8)})`);
+
+    // 2. Create swap intent
+    const minOut = (outAmt * (1 - cfg.slippage)).toFixed(8);
+    const intent = await oneswap.createSwapIntent({
+      poolId: p.poolId,
+      inputToken,
+      amount: String(amount),
+      expectedOutputAmount: outAmt.toFixed(8),
+      minOutputAmount: minOut,
+      slippageTolerance: cfg.slippage,
+    });
+    log('info', `Intent created: ${intent.intentId}, deposit→${intent.depositAddress}`);
+
+    // 3. Send Canton transfer (with memo = deposit reference)
+    const cantonCoin = inputToken; // CC or USDCx
+    const { prepared, submitted } = await canton.sendCoin({
+      receiver: intent.depositAddress,
+      amount: intent.expectedAmount || String(amount),
+      coin: cantonCoin,
+      memo: intent.depositReference,
+    });
+    log('info', `Canton transfer submitted: ledgerEnd=${submitted.ledgerEnd}`);
+
+    // 4. Poll for completion
+    const final = await oneswap.pollIntent(p.poolId, intent.intentId, { maxWaitSec: 300, intervalSec: 5 });
+    log('info', `Final status: ${final.status}, actualOutput: ${final.actualOutputAmount} ${final.actualOutputToken}`);
+
+    // Set cooldown
+    swapCooldownUntil = Date.now() + cfg.swapCooldownSec * 1000;
+
+    return {
+      status: final.status,
+      intentId: intent.intentId,
+      inputToken,
+      inputAmount: amount,
+      outputToken: final.actualOutputToken || outputToken,
+      outputAmount: final.actualOutputAmount || outAmt.toFixed(6),
+      rate: rate.toFixed(8),
+      priceImpact: q.priceImpact,
+      slippage: cfg.slippage,
+      autoReceive: inputToken !== 'CC', // USDCx/CBTC in → CC out = auto; CC in → USDCx out = manual accept
+    };
+  } catch (e) {
+    swapInProgress = false;
+    throw e;
+  } finally {
+    swapInProgress = false;
+  }
 }
 
 // ---------- API fallback (unauthenticated) ----------
